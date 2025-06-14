@@ -24,7 +24,10 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
     };
 
     if request.path == "/" {
-        request.path = String::from("/index.html");
+        let index_path = basedir.join(String::from("/index.html"));
+        if index_path.is_file() {
+            request.path = index_path.to_string_lossy().to_string();
+        }
     }
 
     let path = basedir.join(request.path.strip_prefix("/").unwrap());
