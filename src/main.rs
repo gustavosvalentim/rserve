@@ -1,19 +1,27 @@
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{prelude::*, BufReader, Error};
+use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 
+static NOT_FOUND_VIEW: &'static str = include_str!("pages/404.html");
+static FOLDER_VIEW: &'static str = include_str!("pages/folder_view.html");
+
 pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
     let basedir = PathBuf::from(std::env::current_dir().unwrap().to_str().unwrap());
-    let mut request = HttpRequest::parse(stream);
     let mut response = HttpResponse::new();
+    let mut request = match HttpRequest::parse(stream) {
+        Some(request) => request,
+        None => {
+            response.status_code = 500;
+            response.status_text = String::from("INTERNAL SERVER ERROR");
 
-    println!(
-        "Request {} {} {}",
-        request.method, request.path, request.http_version
-    );
+            stream.write_all(response.to_text().as_bytes()).unwrap();
+
+            return response;
+        }
+    };
 
     if request.path == "/" {
         request.path = String::from("/index.html");
@@ -21,30 +29,60 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
 
     let path = basedir.join(request.path.strip_prefix("/").unwrap());
 
-    if path.is_dir() {
-        // TODO: handle directory here
-    } else {
-        let (content, file_metadata) = match read_file(&path) {
-            Ok((content, file_metadata)) => (content, file_metadata),
-            Err(_) => {
-                response.status_code = 404;
-                response.status_text = String::from("NOT FOUND");
-                return response;
-            }
-        };
+    if !path.exists() {
+        response.content = NOT_FOUND_VIEW.to_string();
+        response.status_code = 404;
+        response.status_text = String::from("NOT FOUND");
+    }
 
-        response.content = String::from_utf8(content).unwrap();
+    if path.is_dir() {
+        let mut output = String::new();
+        for entry in path.read_dir().unwrap() {
+            if let Ok(entry) = entry {
+                let entry_url = format!("{}/{}", request.path, entry.file_name().to_string_lossy());
+                let html_output = format!(
+                    "<li><a href=\"{}\">{}</a></li>",
+                    entry_url,
+                    entry.file_name().to_string_lossy()
+                );
+                output.push_str(html_output.as_str());
+            }
+        }
+        response.content = FOLDER_VIEW.replace("{dir_list}", output.as_str());
         response.headers.insert(
             String::from("Content-Length"),
-            file_metadata.size.to_string(),
+            response.content.len().to_string(),
         );
-        response.headers.insert(
-            String::from("Content-Type"),
-            file_metadata.content_type.to_string(),
-        );
-
-        stream.write_all(response.to_text().as_bytes()).unwrap();
+        response
+            .headers
+            .insert(String::from("Content-Type"), String::from("text/html"));
+    } else {
+        if let Ok((content, file_metadata)) = read_file(&path) {
+            response.content = String::from_utf8(content).unwrap();
+            response.headers.insert(
+                String::from("Content-Length"),
+                file_metadata.size.to_string(),
+            );
+            response.headers.insert(
+                String::from("Content-Type"),
+                file_metadata.content_type.to_string(),
+            );
+        } else {
+            response.status_code = 404;
+            response.status_text = String::from("NOT FOUND");
+        }
     }
+
+    println!(
+        "Request {} {} {} - {} {}",
+        request.method,
+        request.path,
+        request.http_version,
+        response.status_code,
+        response.status_text
+    );
+
+    stream.write_all(response.to_text().as_bytes()).unwrap();
 
     println!(
         "Response {} {} {}",
@@ -74,7 +112,7 @@ fn find_mime_type(path: &PathBuf) -> &'static str {
     mime_type
 }
 
-fn read_file(path: &PathBuf) -> Result<(Vec<u8>, FileMetadata), Error> {
+fn read_file(path: &PathBuf) -> Result<(Vec<u8>, FileMetadata), std::io::Error> {
     let content_type = find_mime_type(path);
     let content = fs::read(path)?;
     let size = content.len();
@@ -97,7 +135,7 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
-    pub fn parse(stream: &TcpStream) -> Self {
+    pub fn parse(stream: &TcpStream) -> Option<Self> {
         let buf_reader = BufReader::new(stream);
         let request_lines: Vec<_> = buf_reader
             .lines()
@@ -105,13 +143,17 @@ impl HttpRequest {
             .take_while(|line| !line.is_empty())
             .collect();
 
+        if request_lines.len() == 0 {
+            return None;
+        }
+
         let status_line: Vec<_> = request_lines[0].split(' ').collect();
 
-        Self {
+        Some(Self {
             method: status_line[0].to_string(),
             path: status_line[1].to_string(),
             http_version: status_line[2].to_string(),
-        }
+        })
     }
 }
 
@@ -123,6 +165,16 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    /**
+     * Creates a new empty response.
+     *
+     * Examples
+     *
+     * ```
+     * let response = HttpResponse::new();
+     * response.headers.insert(String::from("Content-Type"), String::from("text/html"));
+     * ```
+     */
     pub fn new() -> Self {
         Self {
             status_code: 200,
@@ -132,6 +184,22 @@ impl HttpResponse {
         }
     }
 
+    /**
+     * Returns the response in text format.
+     *
+     * Examples:
+     *
+     * ```
+     * let response = HttpResponse::new();
+     * response.status_code = 400;
+     * response.status_text = "BAD REQUEST";
+     *
+     * let response_parts = response.to_text().split("\r\n").collect()[0];
+     * let status_line = response_parts.split(' ').collect();
+     *
+     * assert_eq!("400", status_line[1]);
+     * ```
+     */
     pub fn to_text(&self) -> String {
         let mut text = String::new();
 
@@ -163,7 +231,7 @@ fn main() {
     let settings = Settings::parse();
     let listener = TcpListener::bind(format!("{}:{}", settings.host, settings.port)).unwrap();
 
-    println!("Listening on {}:{}", settings.host, settings.port);
+    println!("Listening on http://{}:{}", settings.host, settings.port);
 
     for stream in listener.incoming() {
         let mut stream = stream.unwrap();

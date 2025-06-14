@@ -15,6 +15,19 @@
 
 ## 📦 Build & Install
 
+**Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gustavosvalentim/rserve/refs/heads/main/scripts/getrserve.sh
+sh getrserve.sh
+```
+
+After running the command above you should be able to run `rserve` from a new terminal window.
+
+**Windows**
+
+`rserve` doesn't have an installation script for **Windows**, so you need to build from source.
+
 ```bash
 git clone https://github.com/gustavosvalentim/rserve.git
 cd rserve
