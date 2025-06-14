@@ -27,8 +27,6 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
         let index_path = basedir.join(String::from("/index.html"));
         if index_path.is_file() {
             request.path = index_path.to_string_lossy().to_string();
-        } else {
-            request.path = String::new();
         }
     }
 
@@ -44,7 +42,11 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
         let mut output = String::new();
         for entry in path.read_dir().unwrap() {
             if let Ok(entry) = entry {
-                let entry_url = format!("{}/{}", request.path, entry.file_name().to_string_lossy());
+                let entry_url = format!(
+                    "{}/{}",
+                    request.path.strip_prefix("/").unwrap(),
+                    entry.file_name().to_string_lossy()
+                );
                 let html_output = format!(
                     "<li><a href=\"{}\">{}</a></li>",
                     entry_url,
