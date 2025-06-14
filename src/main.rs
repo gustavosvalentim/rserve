@@ -27,6 +27,8 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
         let index_path = basedir.join(String::from("/index.html"));
         if index_path.is_file() {
             request.path = index_path.to_string_lossy().to_string();
+        } else {
+            request.path = String::new();
         }
     }
 
