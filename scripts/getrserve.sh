@@ -9,6 +9,6 @@ cd $TEMP_FOLDER
 
 cargo build --release
 
-mv ./target/release/rshttp $BIN_FOLDER
+mv ./target/release/rserve $BIN_FOLDER
 
 rm -rf $TEMP_FOLDER
