@@ -30,7 +30,8 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
         }
     }
 
-    let path = basedir.join(request.path.strip_prefix("/").unwrap());
+    let path_strip_prefix = request.path.strip_prefix("/").unwrap();
+    let path = basedir.join(path_strip_prefix);
 
     if !path.exists() {
         response.content = NOT_FOUND_VIEW.to_string();
@@ -42,16 +43,10 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
         let mut output = String::new();
         for entry in path.read_dir().unwrap() {
             if let Ok(entry) = entry {
-                let entry_url = format!(
-                    "{}/{}",
-                    request.path.strip_prefix("/").unwrap(),
-                    entry.file_name().to_string_lossy()
-                );
-                let html_output = format!(
-                    "<li><a href=\"{}\">{}</a></li>",
-                    entry_url,
-                    entry.file_name().to_string_lossy()
-                );
+                let filename = entry.file_name().to_string_lossy().into_owned();
+                let entry_url = format!("{}/{}", path_strip_prefix, filename);
+                let html_output = format!("<li><a href=\"{}\">{}</a></li>", entry_url, filename);
+
                 output.push_str(html_output.as_str());
             }
         }
