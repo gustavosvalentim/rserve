@@ -3,53 +3,60 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::Path;
 
-static NOT_FOUND_VIEW: &'static str = include_str!("pages/404.html");
-static FOLDER_VIEW: &'static str = include_str!("pages/folder_view.html");
+const NOT_FOUND_VIEW: &str = include_str!("pages/404.html");
+const FOLDER_VIEW: &str = include_str!("pages/folder_view.html");
 
-pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
-    let basedir = PathBuf::from(std::env::current_dir().unwrap().to_str().unwrap());
-    let mut response = HttpResponse::new();
+pub fn handle_connection(mut stream: &TcpStream) {
+    let cwdir = std::env::current_dir().unwrap();
+    let basedir = Path::new(cwdir.to_str().unwrap());
+    let mut response = HttpResponse::default();
     let mut request = match HttpRequest::parse(stream) {
         Some(request) => request,
         None => {
+            println!("Error parsing request");
+
             response.status_code = 500;
             response.status_text = String::from("INTERNAL SERVER ERROR");
-
             stream.write_all(response.to_text().as_bytes()).unwrap();
-
-            return response;
+            return;
         }
     };
 
     if request.path == "/" {
-        let index_path = basedir.join(String::from("/index.html"));
+        let index_path = basedir.join(String::from("index.html"));
         if index_path.is_file() {
             request.path = index_path.to_string_lossy().to_string();
         }
     }
 
-    let path_strip_prefix = request.path.strip_prefix("/").unwrap();
-    let path = basedir.join(path_strip_prefix);
+    let fs_path = basedir.join(request.path.strip_prefix("/").unwrap());
 
-    if !path.exists() {
+    println!("Filesystem path: {}", fs_path.to_str().unwrap());
+
+    if !fs_path.exists() {
         response.content = NOT_FOUND_VIEW.to_string();
         response.status_code = 404;
         response.status_text = String::from("NOT FOUND");
     }
 
-    if path.is_dir() {
+    if fs_path.is_dir() {
         let mut output = String::new();
-        for entry in path.read_dir().unwrap() {
-            if let Ok(entry) = entry {
-                let filename = entry.file_name().to_string_lossy().into_owned();
-                let entry_url = format!("{}/{}", path_strip_prefix, filename);
-                let html_output = format!("<li><a href=\"{}\">{}</a></li>", entry_url, filename);
 
-                output.push_str(html_output.as_str());
-            }
+        for entry in fs_path.read_dir().unwrap().flatten() {
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            let parts = [request.path.as_str(), filename.as_str()];
+            let entry_url = parts.join("/");
+            let html_output = format!("<li><a href=\"{}\">{}</a></li>", entry_url, filename);
+
+            println!("entry_url: {}; filename: {}; html_output: {}", entry_url, filename, html_output);
+
+            output.push_str(html_output.as_str());
         }
+
+        response.status_code = 200;
+        response.status_text = String::from("OK");
         response.content = FOLDER_VIEW.replace("{dir_list}", output.as_str());
         response.headers.insert(
             String::from("Content-Length"),
@@ -58,21 +65,21 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
         response
             .headers
             .insert(String::from("Content-Type"), String::from("text/html"));
+    } else if let Ok((content, file_metadata)) = read_file(&fs_path) {
+        response.status_code = 200;
+        response.status_text = String::from("OK");
+        response.content = String::from_utf8(content).unwrap();
+        response.headers.insert(
+            String::from("Content-Length"),
+            file_metadata.size.to_string(),
+        );
+        response.headers.insert(
+            String::from("Content-Type"),
+            file_metadata.content_type.to_string(),
+        );
     } else {
-        if let Ok((content, file_metadata)) = read_file(&path) {
-            response.content = String::from_utf8(content).unwrap();
-            response.headers.insert(
-                String::from("Content-Length"),
-                file_metadata.size.to_string(),
-            );
-            response.headers.insert(
-                String::from("Content-Type"),
-                file_metadata.content_type.to_string(),
-            );
-        } else {
-            response.status_code = 404;
-            response.status_text = String::from("NOT FOUND");
-        }
+        response.status_code = 500;
+        response.status_text = String::from("INTERNAL SERVER ERROR");
     }
 
     println!(
@@ -90,11 +97,9 @@ pub fn handle_connection(mut stream: &TcpStream) -> HttpResponse {
         "Response {} {} {}",
         request.http_version, response.status_code, response.status_text
     );
-
-    response
 }
 
-fn find_mime_type(path: &PathBuf) -> &'static str {
+fn find_mime_type(path: &Path) -> &'static str {
     let extension = path.extension();
     let mut mime_type = "application/octet-stream";
 
@@ -107,22 +112,20 @@ fn find_mime_type(path: &PathBuf) -> &'static str {
             "svg" => "image/svg+xml",
             "wasm" => "application/wasm",
             "html" => "text/html",
-            _ => mime_type,
+            _ => "text/plain",
         }
     }
 
     mime_type
 }
 
-fn read_file(path: &PathBuf) -> Result<(Vec<u8>, FileMetadata), std::io::Error> {
-    let content_type = find_mime_type(path);
+fn read_file(path: &Path) -> Result<(Vec<u8>, FileMetadata), std::io::Error> {
     let content = fs::read(path)?;
-    let size = content.len();
     let metadata = FileMetadata {
-        content_type: content_type,
-        size,
+        content_type: find_mime_type(path),
+        size: content.len(),
     };
-    return Ok((content, metadata));
+    Ok((content, metadata))
 }
 
 struct FileMetadata {
@@ -145,7 +148,7 @@ impl HttpRequest {
             .take_while(|line| !line.is_empty())
             .collect();
 
-        if request_lines.len() == 0 {
+        if request_lines.is_empty() {
             return None;
         }
 
@@ -159,6 +162,7 @@ impl HttpRequest {
     }
 }
 
+#[derive(Debug, Default)]
 pub struct HttpResponse {
     pub status_code: i32,
     pub status_text: String,
@@ -167,25 +171,6 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
-    /**
-     * Creates a new empty response.
-     *
-     * Examples
-     *
-     * ```
-     * let response = HttpResponse::new();
-     * response.headers.insert(String::from("Content-Type"), String::from("text/html"));
-     * ```
-     */
-    pub fn new() -> Self {
-        Self {
-            status_code: 200,
-            status_text: String::from("OK"),
-            headers: HashMap::new(),
-            content: String::new(),
-        }
-    }
-
     /**
      * Returns the response in text format.
      *
@@ -236,7 +221,7 @@ fn main() {
     println!("Listening on http://{}:{}", settings.host, settings.port);
 
     for stream in listener.incoming() {
-        let mut stream = stream.unwrap();
-        handle_connection(&mut stream);
+        let stream = stream.unwrap();
+        handle_connection(&stream);
     }
 }
