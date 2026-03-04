@@ -11,20 +11,22 @@ const FOLDER_VIEW: &str = include_str!("pages/folder_view.html");
 pub fn handle_connection(mut stream: &TcpStream) {
     let cwdir = std::env::current_dir().unwrap();
     let basedir = Path::new(cwdir.to_str().unwrap());
-    let mut response = HttpResponse::default();
+    let response: HttpResponse;
     let mut request = match HttpRequest::parse(stream) {
         Some(request) => request,
         None => {
             println!("Error parsing request");
 
-            response.status_code = 500;
-            response.status_text = String::from("INTERNAL SERVER ERROR");
+            response = HttpResponse::default()
+                .set_content(String::from("text/plain"), String::from(""))
+                .status(500, String::from("INTERNAL SERVER ERROR"));
+
             stream.write_all(response.to_text().as_bytes()).unwrap();
             return;
         }
     };
 
-    if request.path == "/" {
+    if request.path.ends_with("/") {
         let index_path = basedir.join(String::from("index.html"));
         if index_path.is_file() {
             request.path = index_path.to_string_lossy().to_string();
@@ -32,54 +34,61 @@ pub fn handle_connection(mut stream: &TcpStream) {
     }
 
     let fs_path = basedir.join(request.path.strip_prefix("/").unwrap());
+    let fs_path_in_basedir = fs_path
+        .canonicalize()
+        .unwrap()
+        .starts_with(basedir.canonicalize().unwrap());
 
     println!("Filesystem path: {}", fs_path.to_str().unwrap());
 
-    if !fs_path.exists() {
-        response.content = NOT_FOUND_VIEW.to_string();
-        response.status_code = 404;
-        response.status_text = String::from("NOT FOUND");
-    }
+    if !fs_path.exists() || !fs_path_in_basedir {
+        response = HttpResponse::not_found();
+    } else if fs_path.is_dir() {
+        match fs_path.read_dir() {
+            Ok(entries) => {
+                let mut output = String::new();
 
-    if fs_path.is_dir() {
-        let mut output = String::new();
+                for entry in entries.flatten() {
+                    let filename = entry.file_name().to_string_lossy().into_owned();
+                    let entry_url = if request.path.ends_with('/') {
+                        format!("{}{}", request.path, filename)
+                    } else {
+                        format!("{}/{}", request.path, filename)
+                    };
+                    let html_output = format!("<li><a href=\"{}\">{}</a></li>", entry_url, filename);
 
-        for entry in fs_path.read_dir().unwrap().flatten() {
-            let filename = entry.file_name().to_string_lossy().into_owned();
-            let parts = [request.path.as_str(), filename.as_str()];
-            let entry_url = parts.join("/");
-            let html_output = format!("<li><a href=\"{}\">{}</a></li>", entry_url, filename);
+                    println!("entry_url: {}; filename: {}; html_output: {}", entry_url, filename, html_output);
 
-            println!("entry_url: {}; filename: {}; html_output: {}", entry_url, filename, html_output);
+                    output.push_str(html_output.as_str());
+                }
 
-            output.push_str(html_output.as_str());
+                response = HttpResponse::default()
+                    .set_content(String::from("text/html"), FOLDER_VIEW.replace("{dir_list}", output.as_str()))
+                    .ok();
+            }
+            Err(_) => {
+                response = HttpResponse::default()
+                    .set_content(String::from("text/plain"), String::from("Failed to read directory"))
+                    .status(500, String::from("INTERNAL SERVER ERROR"));
+            }
         }
-
-        response.status_code = 200;
-        response.status_text = String::from("OK");
-        response.content = FOLDER_VIEW.replace("{dir_list}", output.as_str());
-        response.headers.insert(
-            String::from("Content-Length"),
-            response.content.len().to_string(),
-        );
-        response
-            .headers
-            .insert(String::from("Content-Type"), String::from("text/html"));
     } else if let Ok((content, file_metadata)) = read_file(&fs_path) {
-        response.status_code = 200;
-        response.status_text = String::from("OK");
-        response.content = String::from_utf8(content).unwrap();
-        response.headers.insert(
-            String::from("Content-Length"),
-            file_metadata.size.to_string(),
-        );
-        response.headers.insert(
-            String::from("Content-Type"),
-            file_metadata.content_type.to_string(),
-        );
+        match String::from_utf8(content.clone()) {
+            Ok(text_content) => {
+                response = HttpResponse::default()
+                    .set_content(file_metadata.content_type.to_string(), text_content)
+                    .ok();
+            }
+            Err(_) => {
+                response = HttpResponse::default()
+                    .set_content(String::from("text/plain"), format!("Binary file ({} bytes)", file_metadata.size))
+                    .ok();
+            }
+        }
     } else {
-        response.status_code = 500;
-        response.status_text = String::from("INTERNAL SERVER ERROR");
+        response = HttpResponse::default()
+            .set_content(String::from("text/plain"), String::from("Failed to read file"))
+            .status(500, String::from("INTERNAL SERVER ERROR"));
     }
 
     println!(
@@ -164,7 +173,7 @@ impl HttpRequest {
 
 #[derive(Debug, Default)]
 pub struct HttpResponse {
-    pub status_code: i32,
+    pub status_code: u32,
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub content: String,
@@ -190,7 +199,7 @@ impl HttpResponse {
     pub fn to_text(&self) -> String {
         let mut text = String::new();
 
-        text.push_str(format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_code).as_str());
+        text.push_str(format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text).as_str());
 
         for (key, value) in &self.headers {
             text.push_str(format!("{}: {}\r\n", key, value).as_str());
@@ -198,9 +207,41 @@ impl HttpResponse {
 
         text.push_str("\r\n");
         text.push_str(&self.content);
-        text.push_str("\r\n\r\n");
+        text.push_str("\r\n");
 
         text
+    }
+
+    pub fn set_content(mut self, mime_type: String, content: String) -> Self {
+        self.content = content;
+        self.headers.extend(HashMap::from([
+            (String::from("Content-Type"), mime_type),
+            (String::from("Content-Length"), self.content.len().to_string()),
+        ]));
+        self
+    }
+
+    pub fn ok(mut self) -> Self {
+        self.status_code = 200;
+        self.status_text = String::from("OK");
+        self
+    }
+
+    pub fn status(mut self, code: u32, text: String) -> Self {
+        self.status_code = code;
+        self.status_text = text; 
+        self
+    }
+
+    pub fn not_found() -> Self {
+        let mut headers = HashMap::new();
+        headers.insert(String::from("Content-Type"), String::from("text/html"));
+        HttpResponse {
+            status_code: 404,
+            status_text: String::from("NOT FOUND"),
+            content: NOT_FOUND_VIEW.to_string(),
+            headers,
+        }
     }
 }
 
