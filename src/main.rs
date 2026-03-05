@@ -18,32 +18,61 @@ pub fn handle_connection(mut stream: &TcpStream) {
             println!("Error parsing request");
 
             response = HttpResponse::default()
-                .set_content(String::from("text/plain"), String::from(""))
+                .text_content(String::from("text/plain"), String::from(""))
                 .status(500, String::from("INTERNAL SERVER ERROR"));
 
-            stream.write_all(response.to_text().as_bytes()).unwrap();
+            stream.write_all(&response.to_bytes()).unwrap();
             return;
         }
     };
 
     if request.path.ends_with("/") {
-        let index_path = basedir.join(String::from("index.html"));
+        let index_path = basedir.join(
+            Path::new(request.path.as_str()).join(String::from("index.html"))
+        );
         if index_path.is_file() {
             request.path = index_path.to_string_lossy().to_string();
         }
     }
 
-    let fs_path = basedir.join(request.path.strip_prefix("/").unwrap());
-    let fs_path_in_basedir = fs_path
-        .canonicalize()
-        .unwrap()
-        .starts_with(basedir.canonicalize().unwrap());
+    let fs_path = match request.path.strip_prefix("/") {
+        Some(path) => basedir.join(path),
+        None => {
+            response = HttpResponse::default()
+                .text_content(String::from("text/plain"), String::from("Malformed URL"))
+                .status(400, String::from("BAD REQUEST"));
+
+            stream.write_all(&response.to_bytes()).unwrap();
+            return;
+        }
+    };
+
+    if !fs_path.exists() {
+        stream.write_all(&HttpResponse::not_found().to_bytes()).unwrap();
+        return;
+    }
+
+    match fs_path.canonicalize() {
+        Ok(path) => {
+            if !path.starts_with(basedir.canonicalize().unwrap()) {
+                stream.write_all(&HttpResponse::not_found().to_bytes()).unwrap();
+                return;
+            }
+        },
+        Err(_) => {
+            response = HttpResponse::default()
+                .text_content(String::from("text/plain"), String::from(""))
+                .status(500, String::from("INTERNAL SERVER ERROR"));
+
+            stream.write_all(&response.to_bytes()).unwrap();
+
+            return;
+        }
+    }
 
     println!("Filesystem path: {}", fs_path.to_str().unwrap());
-
-    if !fs_path.exists() || !fs_path_in_basedir {
-        response = HttpResponse::not_found();
-    } else if fs_path.is_dir() {
+    
+    if fs_path.is_dir() {
         match fs_path.read_dir() {
             Ok(entries) => {
                 let mut output = String::new();
@@ -63,12 +92,12 @@ pub fn handle_connection(mut stream: &TcpStream) {
                 }
 
                 response = HttpResponse::default()
-                    .set_content(String::from("text/html"), FOLDER_VIEW.replace("{dir_list}", output.as_str()))
+                    .text_content(String::from("text/html"), FOLDER_VIEW.replace("{dir_list}", output.as_str()))
                     .ok();
             }
             Err(_) => {
                 response = HttpResponse::default()
-                    .set_content(String::from("text/plain"), String::from("Failed to read directory"))
+                    .text_content(String::from("text/plain"), String::from("Failed to read directory"))
                     .status(500, String::from("INTERNAL SERVER ERROR"));
             }
         }
@@ -76,18 +105,18 @@ pub fn handle_connection(mut stream: &TcpStream) {
         match String::from_utf8(content.clone()) {
             Ok(text_content) => {
                 response = HttpResponse::default()
-                    .set_content(file_metadata.content_type.to_string(), text_content)
+                    .text_content(file_metadata.content_type.to_string(), text_content)
                     .ok();
             }
             Err(_) => {
                 response = HttpResponse::default()
-                    .set_content(String::from("text/plain"), format!("Binary file ({} bytes)", file_metadata.size))
+                    .bytes_content(String::from("text/plain"), content)
                     .ok();
             }
         }
     } else {
         response = HttpResponse::default()
-            .set_content(String::from("text/plain"), String::from("Failed to read file"))
+            .text_content(String::from("text/plain"), String::from("Failed to read file"))
             .status(500, String::from("INTERNAL SERVER ERROR"));
     }
 
@@ -100,7 +129,7 @@ pub fn handle_connection(mut stream: &TcpStream) {
         response.status_text
     );
 
-    stream.write_all(response.to_text().as_bytes()).unwrap();
+    stream.write_all(&response.to_bytes()).unwrap();
 
     println!(
         "Response {} {} {}",
@@ -132,14 +161,12 @@ fn read_file(path: &Path) -> Result<(Vec<u8>, FileMetadata), std::io::Error> {
     let content = fs::read(path)?;
     let metadata = FileMetadata {
         content_type: find_mime_type(path),
-        size: content.len(),
     };
     Ok((content, metadata))
 }
 
 struct FileMetadata {
     content_type: &'static str,
-    size: usize,
 }
 
 pub struct HttpRequest {
@@ -176,7 +203,7 @@ pub struct HttpResponse {
     pub status_code: u32,
     pub status_text: String,
     pub headers: HashMap<String, String>,
-    pub content: String,
+    pub body: Vec<u8>,
 }
 
 impl HttpResponse {
@@ -196,27 +223,34 @@ impl HttpResponse {
      * assert_eq!("400", status_line[1]);
      * ```
      */
-    pub fn to_text(&self) -> String {
-        let mut text = String::new();
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
 
-        text.push_str(format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text).as_str());
+        write!(&mut out, "HTTP/1.1 {} {}\r\n", self.status_code, self.status_text).unwrap();
 
         for (key, value) in &self.headers {
-            text.push_str(format!("{}: {}\r\n", key, value).as_str());
+            write!(&mut out, "{}: {}\r\n", key, value).unwrap();
         }
 
-        text.push_str("\r\n");
-        text.push_str(&self.content);
-        text.push_str("\r\n");
-
-        text
+        write!(&mut out, "\r\n").unwrap();
+        out.extend_from_slice(&self.body);
+        out
     }
 
-    pub fn set_content(mut self, mime_type: String, content: String) -> Self {
-        self.content = content;
+    pub fn text_content(mut self, mime_type: String, content: String) -> Self {
+        self.body = content.as_bytes().to_vec();
         self.headers.extend(HashMap::from([
             (String::from("Content-Type"), mime_type),
-            (String::from("Content-Length"), self.content.len().to_string()),
+            (String::from("Content-Length"), self.body.len().to_string()),
+        ]));
+        self
+    }
+
+    pub fn bytes_content(mut self, mime_type: String, content: Vec<u8>) -> Self {
+        self.body = content;
+        self.headers.extend(HashMap::from([
+            (String::from("Content-Type"), mime_type),
+            (String::from("Content-Length"), self.body.len().to_string()),
         ]));
         self
     }
@@ -239,7 +273,7 @@ impl HttpResponse {
         HttpResponse {
             status_code: 404,
             status_text: String::from("NOT FOUND"),
-            content: NOT_FOUND_VIEW.to_string(),
+            body: NOT_FOUND_VIEW.as_bytes().to_vec(),
             headers,
         }
     }
